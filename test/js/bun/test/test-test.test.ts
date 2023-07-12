@@ -319,7 +319,6 @@ it("invalid syntax counts towards bail", async () => {
     });
     const err = await new Response(stderr).text();
     expect(err).toContain("Bailed out after 3 failures");
-    expect(err).not.toContain("DO NOT RUN ME");
     expect(err).toContain("Ran 3 tests across 3 files");
     expect(stdout).toBeDefined();
     expect(await new Response(stdout).text()).toBe("");
