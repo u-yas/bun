@@ -136,7 +136,7 @@ mark("Preprocess modules");
 
 const config = ({ platform, debug }: { platform: string; debug?: boolean }) => ({
   entrypoints: bundledEntryPoints,
-  minify: { syntax: true, whitespace: !debug },
+  minify: { syntax: !debug, whitespace: !debug },
   root: TMP,
   define: {
     IS_BUN_DEVELOPMENT: String(!!debug),

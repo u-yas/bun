@@ -163,13 +163,6 @@ interface BunLazyModules {
     describe: typeof import("bun:jsc").jscDescribe;
     describeArray: typeof import("bun:jsc").jscDescribe;
   };
-  "bun:stream": {
-    maybeReadMore: Function;
-    resume: Function;
-    emitReadable: Function;
-    onEofChunk: Function;
-    ReadableState: Function;
-  };
   sqlite: any;
   "vm": {
     createContext: Function;
@@ -178,8 +171,11 @@ interface BunLazyModules {
     runInNewContext: Function;
     runInThisContext: Function;
   };
-  /** typeof === 'undefined', but callable -> throws not implemented */
-  "masqueradesAsUndefined": (...args: any) => any;
+  /* typeof === 'undefined', but callable -> throws not implemented
+   * We dont use this anywhere right now, so it's commented out in native code.
+   */
+  // "masqueradesAsUndefined": (...args: any) => any;
+
   pathToFileURL: typeof import("node:url").pathToFileURL;
   fileURLToPath: typeof import("node:url").fileURLToPath;
   noop: {
