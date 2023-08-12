@@ -44,7 +44,7 @@ const TaggedPointerUnion = @import("./tagged_pointer.zig").TaggedPointerUnion;
 const DeadSocket = opaque {};
 var dead_socket = @as(*DeadSocket, @ptrFromInt(1));
 //TODO: this needs to be freed when Worker Threads are implemented
-var socket_async_http_abort_tracker = std.AutoArrayHashMap(u32, *uws.Socket).init(bun.default_allocator);
+var socket_async_http_tracker = std.AutoArrayHashMap(u32, *uws.Socket).init(bun.default_allocator);
 var async_http_id: std.atomic.Atomic(u32) = std.atomic.Atomic(u32).init(0);
 
 const print_every = 0;
@@ -579,6 +579,7 @@ fn NewHTTPContext(comptime ssl: bool) type {
 const UnboundedQueue = @import("./bun.js/unbounded_queue.zig").UnboundedQueue;
 const Queue = UnboundedQueue(AsyncHTTP, .next);
 const ShutdownQueue = UnboundedQueue(AsyncHTTP, .next);
+const ResumeQueue = UnboundedQueue(AsyncHTTP, .next);
 
 pub const HTTPThread = struct {
     var http_thread_loaded: std.atomic.Atomic(bool) = std.atomic.Atomic(bool).init(false);
@@ -589,6 +590,7 @@ pub const HTTPThread = struct {
 
     queued_tasks: Queue = Queue{},
     queued_shutdowns: ShutdownQueue = ShutdownQueue{},
+    queued_resumes: ResumeQueue = ResumeQueue{},
     has_awoken: std.atomic.Atomic(bool) = std.atomic.Atomic(bool).init(false),
     timer: std.time.Timer = undefined,
     const threadlog = Output.scoped(.HTTPThread, true);
@@ -657,8 +659,20 @@ pub const HTTPThread = struct {
     }
 
     fn drainEvents(this: *@This()) void {
+        while (this.queued_resumes.pop()) |http| {
+            if (socket_async_http_tracker.fetchSwapRemove(http.async_http_id)) |socket_ptr| {
+                if (http.client.isHTTPS()) {
+                    const socket = uws.SocketTLS.from(socket_ptr.value);
+                    http.client.resumeSocket(true, socket);
+                } else {
+                    const socket = uws.SocketTCP.from(socket_ptr.value);
+                    http.client.resumeSocket(false, socket);
+                }
+            }
+        }
+
         while (this.queued_shutdowns.pop()) |http| {
-            if (socket_async_http_abort_tracker.fetchSwapRemove(http.async_http_id)) |socket_ptr| {
+            if (socket_async_http_tracker.fetchSwapRemove(http.async_http_id)) |socket_ptr| {
                 if (http.client.isHTTPS()) {
                     const socket = uws.SocketTLS.from(socket_ptr.value);
                     socket.shutdown();
@@ -719,6 +733,12 @@ pub const HTTPThread = struct {
         unreachable;
     }
 
+    pub fn scheduleResume(this: *@This(), http: *AsyncHTTP) void {
+        this.queued_resumes.push(http);
+        if (this.has_awoken.load(.Monotonic))
+            this.loop.wakeup();
+    }
+
     pub fn scheduleShutdown(this: *@This(), http: *AsyncHTTP) void {
         this.queued_shutdowns.push(http);
         if (this.has_awoken.load(.Monotonic))
@@ -758,7 +778,7 @@ pub fn onOpen(
         }
     }
     if (client.aborted != null) {
-        socket_async_http_abort_tracker.put(client.async_http_id, socket.socket) catch unreachable;
+        socket_async_http_tracker.put(client.async_http_id, socket.socket) catch unreachable;
     }
     log("Connected {s} \n", .{client.url.href});
 
@@ -814,7 +834,7 @@ pub fn onClose(
         if (picohttp.phr_decode_chunked_is_in_data(&client.state.chunked_decoder) == 0) {
             var buf = client.state.getBodyBuffer();
             if (buf.list.items.len > 0) {
-                client.done(comptime is_ssl, if (is_ssl) &http_thread.https_context else &http_thread.http_context, socket);
+                client.progressUpdate(comptime is_ssl, if (is_ssl) &http_thread.https_context else &http_thread.http_context, socket);
                 return;
             }
         }
@@ -998,6 +1018,7 @@ pub const InternalState = struct {
     body_out_str: ?*MutableString = null,
     compressed_body: MutableString = undefined,
     body_size: usize = 0,
+    total_body_received: usize = 0,
     request_body: []const u8 = "",
     original_request_body: HTTPRequestBody = .{ .bytes = "" },
     request_sent_len: usize = 0,
@@ -1135,8 +1156,10 @@ proxy_authorization: ?[]u8 = null,
 proxy_tunneling: bool = false,
 proxy_tunnel: ?ProxyTunnel = null,
 aborted: ?*std.atomic.Atomic(bool) = null,
+events: std.atomic.Atomic(i32),
 async_http_id: u32 = 0,
 hostname: ?[]u8 = null,
+is_streaming: bool = false,
 pub fn init(allocator: std.mem.Allocator, method: Method, url: URL, header_entries: Headers.Entries, header_buf: string, signal: ?*std.atomic.Atomic(bool), hostname: ?[]u8) HTTPClient {
     return HTTPClient{
         .allocator = allocator,
@@ -1146,6 +1169,7 @@ pub fn init(allocator: std.mem.Allocator, method: Method, url: URL, header_entri
         .header_buf = header_buf,
         .aborted = signal,
         .hostname = hostname,
+        .events = std.atomic.Atomic(i32).init(0),
     };
 }
 
@@ -1304,6 +1328,7 @@ pub const AsyncHTTP = struct {
     state: AtomicState = AtomicState.init(State.pending),
     elapsed: u64 = 0,
     gzip_elapsed: u64 = 0,
+    is_streaming: bool = false,
 
     pub var active_requests_count = std.atomic.Atomic(usize).init(0);
     pub var max_simultaneous_requests = std.atomic.Atomic(usize).init(256);
@@ -1364,6 +1389,7 @@ pub const AsyncHTTP = struct {
         signal: ?*std.atomic.Atomic(bool),
         hostname: ?[]u8,
         redirect_type: FetchRedirect,
+        stream_data: bool,
     ) AsyncHTTP {
         var this = AsyncHTTP{
             .allocator = allocator,
@@ -1376,6 +1402,7 @@ pub const AsyncHTTP = struct {
             .completion_callback = callback,
             .http_proxy = http_proxy,
             .async_http_id = if (signal != null) async_http_id.fetchAdd(1, .Monotonic) else 0,
+            .is_streaming = stream_data,
         };
 
         this.client = HTTPClient.init(allocator, method, url, headers, headers_buf, signal, hostname);
@@ -1383,6 +1410,7 @@ pub const AsyncHTTP = struct {
         this.client.timeout = timeout;
         this.client.http_proxy = this.http_proxy;
         this.client.redirect_type = redirect_type;
+        this.client.is_streaming = stream_data;
         this.timeout = timeout;
 
         if (http_proxy) |proxy| {
@@ -1449,8 +1477,8 @@ pub const AsyncHTTP = struct {
         return this;
     }
 
-    pub fn initSync(allocator: std.mem.Allocator, method: Method, url: URL, headers: Headers.Entries, headers_buf: string, response_buffer: *MutableString, request_body: []const u8, timeout: usize, http_proxy: ?URL, hostname: ?[]u8, redirect_type: FetchRedirect) AsyncHTTP {
-        return @This().init(allocator, method, url, headers, headers_buf, response_buffer, request_body, timeout, undefined, http_proxy, null, hostname, redirect_type);
+    pub fn initSync(allocator: std.mem.Allocator, method: Method, url: URL, headers: Headers.Entries, headers_buf: string, response_buffer: *MutableString, request_body: []const u8, timeout: usize, http_proxy: ?URL, hostname: ?[]u8, redirect_type: FetchRedirect, stream_data: bool) AsyncHTTP {
+        return @This().init(allocator, method, url, headers, headers_buf, response_buffer, request_body, timeout, undefined, http_proxy, null, hostname, redirect_type, stream_data);
     }
 
     fn reset(this: *AsyncHTTP) !void {
@@ -1619,6 +1647,27 @@ pub fn hasSignalAborted(this: *const HTTPClient) bool {
     return (this.aborted orelse return false).load(.Monotonic);
 }
 
+pub fn isSocketPaused(this: *const HTTPClient) bool {
+    return (this.events).load(.Monotonic) != 0;
+}
+
+pub fn pauseSocket(this: *HTTPClient, comptime is_ssl: bool, socket: NewHTTPContext(is_ssl).HTTPSocket) void {
+    if (this.isSocketPaused()) {
+        return;
+    }
+    this.events.store(socket.pausePoll(), .Monotonic);
+}
+
+pub fn resumeSocket(this: *HTTPClient, comptime is_ssl: bool, socket: NewHTTPContext(is_ssl).HTTPSocket) void {
+    const events = (this.events).load(.Monotonic);
+    if (events == 0) {
+        return;
+    }
+
+    socket.resumePoll(events);
+    this.events.store(0, .Monotonic);
+}
+
 pub fn buildRequest(this: *HTTPClient, body_len: usize) picohttp.Request {
     var header_count: usize = 0;
     var header_entries = this.header_entries.slice();
@@ -1743,7 +1792,7 @@ pub fn doRedirect(this: *HTTPClient) void {
         this.proxy_tunnel = null;
     }
     if (this.aborted != null) {
-        _ = socket_async_http_abort_tracker.swapRemove(this.async_http_id);
+        _ = socket_async_http_tracker.swapRemove(this.async_http_id);
     }
     return this.start(.{ .bytes = "" }, body_out_str);
 }
@@ -2243,7 +2292,7 @@ pub fn onData(this: *HTTPClient, comptime is_ssl: bool, incoming_data: []const u
             this.cloneMetadata();
 
             if (!can_continue) {
-                this.done(is_ssl, ctx, socket);
+                this.progressUpdate(is_ssl, ctx, socket);
                 return;
             }
 
@@ -2258,13 +2307,13 @@ pub fn onData(this: *HTTPClient, comptime is_ssl: bool, incoming_data: []const u
 
             if (this.state.response_stage == .body) {
                 {
-                    const is_done = this.handleResponseBody(body_buf, true) catch |err| {
+                    const is_done = this.handleResponseBody(body_buf, true, is_ssl, socket) catch |err| {
                         this.closeAndFail(err, is_ssl, socket);
                         return;
                     };
 
                     if (is_done) {
-                        this.done(is_ssl, ctx, socket);
+                        this.progressUpdate(is_ssl, ctx, socket);
                         return;
                     }
                 }
@@ -2277,7 +2326,7 @@ pub fn onData(this: *HTTPClient, comptime is_ssl: bool, incoming_data: []const u
                     };
 
                     if (is_done) {
-                        this.done(is_ssl, ctx, socket);
+                        this.progressUpdate(is_ssl, ctx, socket);
                         return;
                     }
                 }
@@ -2297,23 +2346,23 @@ pub fn onData(this: *HTTPClient, comptime is_ssl: bool, incoming_data: []const u
                 defer data.deinit();
                 const decoded_data = data.slice();
                 if (decoded_data.len == 0) return;
-                const is_done = this.handleResponseBody(decoded_data, false) catch |err| {
+                const is_done = this.handleResponseBody(decoded_data, false, is_ssl, socket) catch |err| {
                     this.closeAndFail(err, is_ssl, socket);
                     return;
                 };
 
                 if (is_done) {
-                    this.done(is_ssl, ctx, socket);
+                    this.progressUpdate(is_ssl, ctx, socket);
                     return;
                 }
             } else {
-                const is_done = this.handleResponseBody(incoming_data, false) catch |err| {
+                const is_done = this.handleResponseBody(incoming_data, false, is_ssl, socket) catch |err| {
                     this.closeAndFail(err, is_ssl, socket);
                     return;
                 };
 
                 if (is_done) {
-                    this.done(is_ssl, ctx, socket);
+                    this.progressUpdate(is_ssl, ctx, socket);
                     return;
                 }
             }
@@ -2339,7 +2388,7 @@ pub fn onData(this: *HTTPClient, comptime is_ssl: bool, incoming_data: []const u
                 };
 
                 if (is_done) {
-                    this.done(is_ssl, ctx, socket);
+                    this.progressUpdate(is_ssl, ctx, socket);
                     return;
                 }
             } else {
@@ -2349,7 +2398,7 @@ pub fn onData(this: *HTTPClient, comptime is_ssl: bool, incoming_data: []const u
                 };
 
                 if (is_done) {
-                    this.done(is_ssl, ctx, socket);
+                    this.progressUpdate(is_ssl, ctx, socket);
                     return;
                 }
             }
@@ -2398,7 +2447,7 @@ pub fn closeAndAbort(this: *HTTPClient, comptime is_ssl: bool, socket: NewHTTPCo
 
 fn fail(this: *HTTPClient, err: anyerror) void {
     if (this.aborted != null) {
-        _ = socket_async_http_abort_tracker.swapRemove(this.async_http_id);
+        _ = socket_async_http_tracker.swapRemove(this.async_http_id);
     }
     this.state.request_stage = .fail;
     this.state.response_stage = .fail;
@@ -2442,10 +2491,11 @@ pub fn setTimeout(this: *HTTPClient, socket: anytype, amount: c_uint) void {
     socket.timeout(amount);
 }
 
-pub fn done(this: *HTTPClient, comptime is_ssl: bool, ctx: *NewHTTPContext(is_ssl), socket: NewHTTPContext(is_ssl).HTTPSocket) void {
+pub fn progressUpdate(this: *HTTPClient, comptime is_ssl: bool, ctx: *NewHTTPContext(is_ssl), socket: NewHTTPContext(is_ssl).HTTPSocket) void {
     if (this.state.stage != .done and this.state.stage != .fail) {
-        if (this.aborted != null) {
-            _ = socket_async_http_abort_tracker.swapRemove(this.async_http_id);
+        const is_done = this.isDone();
+        if (this.aborted != null and is_done) {
+            _ = socket_async_http_tracker.swapRemove(this.async_http_id);
         }
 
         log("done", .{});
@@ -2456,25 +2506,26 @@ pub fn done(this: *HTTPClient, comptime is_ssl: bool, ctx: *NewHTTPContext(is_ss
         const result = this.toResult(this.cloned_metadata);
         const callback = this.completion_callback;
 
-        socket.ext(**anyopaque).?.* = bun.cast(**anyopaque, NewHTTPContext(is_ssl).ActiveSocket.init(&dead_socket).ptr());
+        if (is_done) {
+            socket.ext(**anyopaque).?.* = bun.cast(**anyopaque, NewHTTPContext(is_ssl).ActiveSocket.init(&dead_socket).ptr());
 
-        if (this.state.allow_keepalive and !this.disable_keepalive and !socket.isClosed() and FeatureFlags.enable_keepalive) {
-            ctx.releaseSocket(
-                socket,
-                this.connected_url.hostname,
-                this.connected_url.getPortAuto(),
-            );
-        } else if (!socket.isClosed()) {
-            socket.close(0, null);
+            if (this.state.allow_keepalive and !this.disable_keepalive and !socket.isClosed() and FeatureFlags.enable_keepalive) {
+                ctx.releaseSocket(
+                    socket,
+                    this.connected_url.hostname,
+                    this.connected_url.getPortAuto(),
+                );
+            } else if (!socket.isClosed()) {
+                socket.close(0, null);
+            }
+
+            this.state.reset();
+            this.state.response_stage = .done;
+            this.state.request_stage = .done;
+            this.state.stage = .done;
+            this.proxy_tunneling = false;
         }
-
-        this.state.reset();
         result.body.?.* = body;
-        std.debug.assert(this.state.stage != .done);
-        this.state.response_stage = .done;
-        this.state.request_stage = .done;
-        this.state.stage = .done;
-        this.proxy_tunneling = false;
         if (comptime print_every > 0) {
             print_every_i += 1;
             if (print_every_i % print_every == 0) {
@@ -2496,6 +2547,8 @@ pub const HTTPClientResult = struct {
     fail: anyerror = error.NoError,
     redirected: bool = false,
     headers_buf: []picohttp.Header = &.{},
+    has_more: bool = false,
+    body_size: usize = 0,
 
     pub fn isSuccess(this: *const HTTPClientResult) bool {
         return this.fail == error.NoError;
@@ -2557,6 +2610,8 @@ pub fn toResult(this: *HTTPClient, metadata: HTTPResponseMetadata) HTTPClientRes
         .href = metadata.url,
         .fail = this.state.fail,
         .headers_buf = metadata.response.headers,
+        .has_more = this.is_streaming and !this.isDone(),
+        .body_size = this.state.body_size,
     };
 }
 
@@ -2565,16 +2620,19 @@ pub fn toResult(this: *HTTPClient, metadata: HTTPResponseMetadata) HTTPClientRes
 // reporting gigantic Conten-Length and then
 // never finishing sending the body
 const preallocate_max = 1024 * 1024 * 256;
+// if the body is less than 64kb we dont stream
+const streaming_buffer_size = 1024 * 64;
 
-pub fn handleResponseBody(this: *HTTPClient, incoming_data: []const u8, is_only_buffer: bool) !bool {
+pub fn handleResponseBody(this: *HTTPClient, incoming_data: []const u8, is_only_buffer: bool, comptime is_ssl: bool, socket: NewHTTPContext(is_ssl).HTTPSocket) !bool {
     std.debug.assert(this.state.transfer_encoding == .identity);
+    this.state.total_body_received += incoming_data.len;
 
     // is it exactly as much as we need?
     if (is_only_buffer and incoming_data.len >= this.state.body_size) {
         try handleResponseBodyFromSinglePacket(this, incoming_data[0..this.state.body_size]);
         return true;
     } else {
-        return handleResponseBodyFromMultiplePackets(this, incoming_data);
+        return handleResponseBodyFromMultiplePackets(this, incoming_data, is_ssl, socket);
     }
 }
 
@@ -2610,36 +2668,60 @@ fn handleResponseBodyFromSinglePacket(this: *HTTPClient, incoming_data: []const 
     this.state.postProcessBody(this.state.getBodyBuffer());
 }
 
-fn handleResponseBodyFromMultiplePackets(this: *HTTPClient, incoming_data: []const u8) !bool {
+fn isDone(this: *HTTPClient) bool {
+    return this.state.total_body_received == this.state.body_size;
+}
+
+fn handleResponseBodyFromMultiplePackets(this: *HTTPClient, incoming_data: []const u8, comptime is_ssl: bool, socket: NewHTTPContext(is_ssl).HTTPSocket) !bool {
     var buffer = this.state.getBodyBuffer();
 
     if (buffer.list.items.len == 0 and
         this.state.body_size > 0 and this.state.body_size < preallocate_max)
     {
-        // since we don't do streaming yet, we might as well just allocate the whole thing
-        // when we know the expected size
-        buffer.list.ensureTotalCapacityPrecise(buffer.allocator, this.state.body_size) catch {};
+        // TODO: allow streaming for gzip and deflate
+        if (this.state.body_size <= streaming_buffer_size or this.is_streaming == false or this.state.encoding == Encoding.gzip or this.state.encoding == Encoding.deflate) {
+            this.is_streaming = false;
+            // if is less than 64kb or we are not streaming we preallocate evertything
+            buffer.list.ensureTotalCapacityPrecise(buffer.allocator, this.state.body_size) catch {};
+        } else {
+            // if is more than 64kb we preallocate 64kb or at least the size of the incoming data
+            if (incoming_data.len > streaming_buffer_size) {
+                buffer.list.ensureTotalCapacity(buffer.allocator, incoming_data.len) catch {};
+            } else {
+                buffer.list.ensureTotalCapacity(buffer.allocator, streaming_buffer_size) catch {};
+            }
+        }
     }
 
-    const remaining_content_length = this.state.body_size -| buffer.list.items.len;
+    const remaining_content_length = this.state.body_size -| this.state.total_body_received;
     var remainder = incoming_data[0..@min(incoming_data.len, remaining_content_length)];
 
     _ = try buffer.write(remainder);
 
     if (this.progress_node) |progress| {
         progress.activate();
-        progress.setCompletedItems(buffer.list.items.len);
+        progress.setCompletedItems(this.state.total_body_received);
         progress.context.maybeRefresh();
     }
 
-    if (buffer.list.items.len == this.state.body_size) {
+    // done
+    if (this.state.total_body_received >= this.state.body_size) {
         try this.state.processBodyBuffer(buffer.*);
 
         if (this.progress_node) |progress| {
             progress.activate();
-            progress.setCompletedItems(buffer.list.items.len);
+            progress.setCompletedItems(this.state.total_body_received);
             progress.context.maybeRefresh();
         }
+        return true;
+    }
+
+    // we are streaming and received 64Kb or more of data
+    if (this.is_streaming and buffer.list.items.len >= streaming_buffer_size) {
+        // we filled up the buffer, so we can process it
+        this.pauseSocket(is_ssl, socket);
+        
+        try this.state.processBodyBuffer(buffer.*);
         return true;
     }
 
